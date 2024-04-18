@@ -44,6 +44,8 @@ export class FastifyQueryApi {
             origin: '*',
             credentials: true,
         });
+
+        this.createSwaager(option);
     }
 
     private createSwaager(option: FastifySwaggerOption) {
