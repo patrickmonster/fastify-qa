@@ -5,9 +5,7 @@ import fp from 'fastify-plugin';
 
 declare module 'fastify' {
     interface FastifyInstance {
-        masterkey: (request: FastifyRequest, reply: FastifyReply, done: Function) => void;
         authenticate: (request: FastifyRequest, reply: FastifyReply, done: Function) => void;
-        authenticateQuarter: (request: FastifyRequest, reply: FastifyReply, done: Function) => void;
     }
 }
 
