@@ -1,17 +1,19 @@
-import cors from '@fastify/cors';
+import cors, { OriginFunction } from '@fastify/cors';
 import helmet from '@fastify/helmet';
+import jwt from '@fastify/jwt';
 import error from '@fastify/sensible';
 import { fastifySwagger } from '@fastify/swagger';
 import swagger_ui from '@fastify/swagger-ui';
 
 import { Options as AjvOptions } from 'ajv/dist/core';
-import fastify, {
+import Fastify, {
     FastifyInstance,
     FastifyListenOptions,
     FastifyReply,
     FastifyRequest,
     FastifySchema,
     RequestGenericInterface,
+    RouteHandlerMethod,
 } from 'fastify';
 
 import { OpenAPIV3, OpenAPIV3_1 } from 'openapi-types';
@@ -42,15 +44,21 @@ type ResqultQuery<E> = E extends SqlInsertUpdate ? sqlInsertUpdate : Array<E>;
 
 export type queryFunctionType = <E>(query: string, ...params: any[]) => Promise<ResqultQuery<E>>;
 
+interface ArrayOfValueOrArray<T> extends Array<ValueOrArray<T>> {}
+type OriginType = string | boolean | RegExp;
+type ValueOrArray<T> = T | ArrayOfValueOrArray<T>;
+
 interface FastifySwaggerOption {
+    cros: ValueOrArray<OriginType> | OriginFunction;
+    jwt?: { secret: string };
     avj?: {
         customOptions?: AjvOptions;
         plugins?: (Function | [Function, unknown])[];
     };
     database: {
         limit?: string;
-        selectQuery: (query: string, ...params: any[]) => Promise<Array<any>>;
-        insertUpdateDeleteQuery: (query: string, ...params: any[]) => Promise<sqlInsertUpdate>;
+        selectQuery: (req: FastifyRequest, query: string, ...params: any[]) => Promise<Array<any>>;
+        insertUpdateDeleteQuery: (req: FastifyRequest, query: string, ...params: any[]) => Promise<sqlInsertUpdate>;
     };
     tags?: OpenAPIV3.TagObject[];
     components: OpenAPIV3_1.ComponentsObject;
@@ -58,41 +66,42 @@ interface FastifySwaggerOption {
     doc: FastifyDocumentOption;
 }
 
+interface RouterOption {
+    onRequest?: Array<(request: FastifyRequest, reply: FastifyReply, done: Function) => void>;
+    schema?: FastifySchema; // originally FastifySchema
+}
+
 export class FastifyQueryApi {
     option: FastifySwaggerOption;
-    server: FastifyInstance;
+    fastify: FastifyInstance;
 
     constructor(option: FastifySwaggerOption) {
         this.option = option;
-        this.server = fastify({
+        this.fastify = Fastify({
             logger: { transport: { target: '@fastify/one-line-logger' } },
             ajv: option.avj,
         });
 
-        this.server.register(error);
-        this.server.register(helmet, { global: true });
-        this.server.register(cors, {
-            origin: '*',
-            credentials: true,
-        });
+        this.fastify.register(error);
+        this.fastify.register(helmet, { global: true });
+        this.fastify.register(cors, { origin: option.cros, credentials: true });
+        if (typeof option.jwt == 'string') this.fastify.register(jwt, { secret: option.jwt });
 
-        this.server.get(
-            '',
-            {
-                onRequest: [],
-                schema: {},
-            },
-            async (req, res) => {
-                return { message: 'Fastify Query API' };
-            }
-        );
+        this.fastify.decorate('authenticate', function (request: FastifyRequest, reply: FastifyReply, done: Function) {
+            request
+                .jwtVerify()
+                .then(() => done())
+                .catch(e => {
+                    reply.unauthorized(e.message);
+                });
+        });
 
         this.createSwaager(option);
     }
 
     private createSwaager(option: FastifySwaggerOption) {
         const { components, doc, info, tags } = option;
-        this.server.register(fastifySwagger, {
+        this.fastify.register(fastifySwagger, {
             openapi: {
                 openapi: '3.0.0',
                 info,
@@ -101,52 +110,56 @@ export class FastifyQueryApi {
             },
         });
 
-        this.server.register(swagger_ui, {
+        this.fastify.register(swagger_ui, {
             routePrefix: doc.path,
             // logo: doc?.logo,
             uiConfig: { docExpansion: 'list', deepLinking: false },
         });
     }
 
-    public addRoute(method: 'get' | 'post' | 'put' | 'delete', path: string, handler: (req: any, res: any) => void) {
-        this.server.route({
-            method,
-            url: path,
-            handler,
-        });
+    public get<T extends RequestGenericInterface>(path: string, opts: RouterOption, handler: RouteHandlerMethod) {
+        this.fastify.get<T>(path, opts, handler);
     }
 
-    public addSelectRoute<T extends RequestGenericInterface, SchemaCompiler extends FastifySchema>(
-        path: string,
-        opts: {
-            onRequest: Array<(request: FastifyRequest, reply: FastifyReply, done: Function) => void>;
-            schema: SchemaCompiler; // originally FastifySchema
-        },
-        query: string,
-        params: any[]
-    ) {
-        const onRequest = opts.onRequest;
-        const { database } = this.option;
+    public post<T extends RequestGenericInterface>(path: string, opts: RouterOption, handler: RouteHandlerMethod) {
+        this.fastify.post<T>(path, opts, handler);
+    }
 
-        this.server.get(
-            path,
-            {
-                onRequest,
-                schema: opts.schema,
-            },
-            async (req, res) => {
-                const { selectQuery } = database;
-                return selectQuery ? await selectQuery(query, ...params) : this.server.httpErrors.notImplemented();
-            }
+    public put<T extends RequestGenericInterface>(path: string, opts: RouterOption, handler: RouteHandlerMethod) {
+        this.fastify.put<T>(path, opts, handler);
+    }
+
+    public delete<T extends RequestGenericInterface>(path: string, opts: RouterOption, handler: RouteHandlerMethod) {
+        this.fastify.delete<T>(path, opts, handler);
+    }
+
+    getObjectToSchema<T extends RequestGenericInterface>(schema: Object) {
+        JSON.stringify(schema);
+    }
+
+    public select<T extends RequestGenericInterface>(
+        opts: RouterOption & { path: string },
+        query: string,
+        getParemeters?: (req: FastifyRequest) => Promise<any[]> | any[]
+    ) {
+        this.get<T>(
+            opts.path,
+            opts,
+            async (req, res) =>
+                await this.option.database.selectQuery(req, query, getParemeters ? await getParemeters(req) : [])
         );
     }
 
     listen(options: FastifyListenOptions, callback?: (err: Error | null, address: string) => void) {
         const bootTime = Date.now();
-        this.server.listen(options, (err, address) => {
+        this.fastify.listen(options, (err, address) => {
             callback && callback(err, address);
             const time = Date.now() - bootTime;
-            console.log(`Server started in  ${Math.floor(time / 1000)} (${time}ms) - Fastify Query API`);
+            console.log(`Server started in  ${Math.floor(time / 1000)} (${time}ms) - Fastify Query API ${address}`);
         });
+    }
+
+    async close() {
+        await this.fastify.close();
     }
 }
